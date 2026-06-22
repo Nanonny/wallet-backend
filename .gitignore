@@ -1,0 +1,9 @@
+/bin
+/dist
+/actions-runner/
+/wallet-api
+/grpc-client
+.env
+.DS_Store
+*.log
+coverage.out

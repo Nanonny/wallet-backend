@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wallet-api-pdb
+  namespace: wallet-demo
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: wallet-api

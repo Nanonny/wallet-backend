@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package wallet.v1;
+
+option go_package = "github.com/anon/wallet-devops-lab/api/proto/walletpb";
+
+service WalletService {
+  rpc CreateWallet(CreateWalletRequest) returns (CreateWalletResponse);
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc Deposit(DepositRequest) returns (TransactionResponse);
+  rpc Withdraw(WithdrawRequest) returns (TransactionResponse);
+  rpc Transfer(TransferRequest) returns (TransactionResponse);
+}
+
+message CreateWalletRequest {
+  string user_id = 1;
+  int64 initial_balance_cents = 2;
+}
+
+message CreateWalletResponse {
+  string wallet_id = 1;
+  string user_id = 2;
+  int64 balance_cents = 3;
+}
+
+message GetBalanceRequest {
+  string wallet_id = 1;
+}
+
+message GetBalanceResponse {
+  string wallet_id = 1;
+  int64 balance_cents = 2;
+}
+
+message DepositRequest {
+  string wallet_id = 1;
+  int64 amount_cents = 2;
+  string request_id = 3;
+}
+
+message WithdrawRequest {
+  string wallet_id = 1;
+  int64 amount_cents = 2;
+  string request_id = 3;
+}
+
+message TransferRequest {
+  string from_wallet_id = 1;
+  string to_wallet_id = 2;
+  int64 amount_cents = 3;
+  string request_id = 4;
+}
+
+message TransactionResponse {
+  string transaction_id = 1;
+  string status = 2;
+  string message = 3;
+}
