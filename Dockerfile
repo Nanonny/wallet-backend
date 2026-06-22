@@ -18,7 +18,7 @@ RUN if [ -z "$TARGETARCH" ]; then \
       CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /wallet-api ./cmd/wallet-api; \
     fi
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 WORKDIR /app
 
