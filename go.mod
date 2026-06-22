@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/prometheus/client_golang v1.20.5
-	github.com/redis/go-redis/v9 v9.20.1
+	github.com/redis/go-redis/v9 v9.21.0
 	google.golang.org/grpc v1.81.1
 )
 
