@@ -22,7 +22,9 @@ FROM alpine:3.22
 
 WORKDIR /app
 
-RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
+RUN apk upgrade --no-cache \
+    && addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app
 
 COPY --from=builder /wallet-api /app/wallet-api
 
