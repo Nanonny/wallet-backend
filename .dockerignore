@@ -1,0 +1,14 @@
+.git
+.github
+actions-runner
+bin
+dist
+/wallet-api
+/grpc-client
+coverage.out
+*.test
+*.zip
+.env
+.env.*
+.DS_Store
+README.local.md
