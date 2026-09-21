@@ -58,8 +58,9 @@ func (c Config) PostgresDSN() string {
 	}
 	host := fmt.Sprintf("%s:%s", c.PGHost, c.PGPort)
 	if c.PGPassword != "" {
-		auth := url.URL{User: url.UserPassword(c.PGUser, c.PGPassword)}
-		return "postgres://" + auth.String() + "@" + host + "/" + c.PGDatabase + "?sslmode=" + c.PGSSLMode
+		// url.UserPassword(...).String() percent-escapes both values and does
+		// NOT include the "@" separator, so add it exactly once here.
+		return "postgres://" + url.UserPassword(c.PGUser, c.PGPassword).String() + "@" + host + "/" + c.PGDatabase + "?sslmode=" + c.PGSSLMode
 	}
 	return fmt.Sprintf("postgres://%s@%s/%s?sslmode=%s", c.PGUser, host, c.PGDatabase, c.PGSSLMode)
 }
