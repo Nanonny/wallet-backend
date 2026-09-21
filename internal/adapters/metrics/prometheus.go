@@ -49,6 +49,14 @@ var (
 			Help: "Number of active wallets known by repository.",
 		},
 	)
+
+	AuthEventsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "wallet_auth_events_total",
+			Help: "Authentication events by type and result.",
+		},
+		[]string{"event", "result"},
+	)
 )
 
 func MustRegister() {
@@ -57,7 +65,12 @@ func MustRegister() {
 	prometheus.MustRegister(WalletRequestDurationSeconds)
 	prometheus.MustRegister(WalletTransfersTotal)
 	prometheus.MustRegister(WalletActiveWallets)
+	prometheus.MustRegister(AuthEventsTotal)
+}
 
+// RecordAuth counts an authentication event (login/register) and its result.
+func RecordAuth(event, result string) {
+	AuthEventsTotal.WithLabelValues(event, result).Inc()
 }
 
 type statusRecorder struct {

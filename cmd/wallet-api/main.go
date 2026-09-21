@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net"
@@ -19,6 +21,7 @@ import (
 	httpadapter "github.com/anon/wallet-devops-lab/internal/adapters/http"
 	"github.com/anon/wallet-devops-lab/internal/adapters/memory"
 	"github.com/anon/wallet-devops-lab/internal/adapters/metrics"
+	postgresadapter "github.com/anon/wallet-devops-lab/internal/adapters/postgres"
 	redisrepo "github.com/anon/wallet-devops-lab/internal/adapters/redis"
 	"github.com/anon/wallet-devops-lab/internal/application"
 	"github.com/anon/wallet-devops-lab/internal/config"
@@ -30,25 +33,82 @@ func main() {
 	grpcadapter.RegisterJSONCodec()
 
 	ctx := context.Background()
-	var repo application.WalletRepository
 
+	// Wallet state (Redis or in-memory for the zero-dependency demo).
+	var walletRepo application.WalletRepository
 	if strings.EqualFold(cfg.Storage, "memory") {
-		log.Println("storage=memory")
-		repo = memory.NewWalletRepository()
+		log.Println("storage=memory (wallets)")
+		walletRepo = memory.NewWalletRepository()
 	} else {
 		log.Printf("storage=redis redis_addr=%s", cfg.RedisAddr)
-		r := redisrepo.NewWalletRepository(cfg.RedisAddr)
+		r := redisrepo.NewWalletRepository(cfg.RedisAddr, cfg.RedisPassword)
 		if err := r.Ping(ctx); err != nil {
 			log.Fatalf("redis ping failed: %v", err)
 		}
-		repo = r
+		defer func() {
+			if err := r.Close(); err != nil {
+				log.Printf("close redis: %v", err)
+			}
+		}()
+		walletRepo = r
 	}
 
-	walletSvc := application.NewWalletService(repo)
+	// User accounts (PostgreSQL, or in-memory in zero-dependency demo mode).
+	var userRepo application.UserRepository
+	if strings.EqualFold(cfg.Storage, "memory") {
+		log.Println("storage=memory (users)")
+		userRepo = memory.NewUserRepository()
+	} else {
+		dsn := cfg.PostgresDSN()
+		db, err := postgresadapter.Open(ctx, dsn, 30*time.Second)
+		if err != nil {
+			log.Fatalf("connect postgres: %v (start it with: docker compose up -d postgres)", err)
+		}
+		defer postgresadapter.Close(db)
+		if err := postgresadapter.Migrate(ctx, db); err != nil {
+			log.Fatalf("postgres migrate: %v", err)
+		}
+		log.Printf("storage=postgres host=%s user=%s", cfg.PGHost, cfg.PGUser)
+		userRepo = postgresadapter.NewUserRepository(db)
+	}
 
-	metricsServer := &http.Server{Addr: ":" + cfg.MetricsPort, Handler: promhttp.Handler()}
-	httpServer := &http.Server{Addr: ":" + cfg.HTTPPort, Handler: httpadapter.NewHandler(walletSvc).Routes()}
-	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(metrics.GRPCUnaryServerInterceptor()))
+	walletSvc := application.NewWalletService(walletRepo)
+	userSvc := application.NewUserService(userRepo)
+
+	jwtSecret := cfg.JWTSecret
+	if jwtSecret == "" {
+		var b [32]byte
+		if _, err := cryptorand.Read(b[:]); err != nil {
+			log.Fatalf("generate jwt secret: %v", err)
+		}
+		jwtSecret = hex.EncodeToString(b[:])
+		log.Println("WARNING: JWT_SECRET is not set; using an ephemeral secret. Sessions will not survive a restart and shared replicas will disagree. Set JWT_SECRET for real deployments.")
+	}
+	tokenSvc, err := application.NewTokenService(jwtSecret)
+	if err != nil {
+		log.Fatalf("initialize token service: %v", err)
+	}
+
+	metricsServer := &http.Server{
+		Addr:              ":" + cfg.MetricsPort,
+		Handler:           promhttp.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	httpServer := &http.Server{
+		Addr:              ":" + cfg.HTTPPort,
+		Handler:           httpadapter.NewHandler(walletSvc, userSvc, tokenSvc).Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			grpcadapter.AuthUnaryServerInterceptor(tokenSvc),
+			metrics.GRPCUnaryServerInterceptor(),
+		),
+	)
 	grpcadapter.RegisterWalletServiceServer(grpcServer, grpcadapter.NewWalletGRPCServer(walletSvc))
 
 	go func() {

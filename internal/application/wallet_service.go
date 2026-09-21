@@ -2,11 +2,12 @@ package application
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"time"
 
-	"github.com/anon/wallet-devops-lab/internal/adapters/metrics"
 	"github.com/anon/wallet-devops-lab/internal/domain"
 )
 
@@ -19,42 +20,53 @@ func NewWalletService(repo WalletRepository) *WalletService {
 }
 
 func (s *WalletService) CreateWallet(ctx context.Context, userID string, initialBalanceCents int64) (domain.Wallet, error) {
+	subject := SubjectFromContext(ctx)
 	if userID == "" {
-		userID = fmt.Sprintf("user-%d", time.Now().UnixNano())
+		// Default the owner to the authenticated subject; fall back to a
+		// generated id for unauthenticated internal calls (unit tests).
+		userID = subject
+		if userID == "" {
+			userID = "user-" + newID()
+		}
+	} else if subject != "" && userID != subject {
+		return domain.Wallet{}, domain.ErrWalletForbidden
 	}
 	if initialBalanceCents < 0 {
 		return domain.Wallet{}, domain.ErrInvalidAmount
 	}
 
 	wallet := domain.Wallet{
-		ID:           fmt.Sprintf("wlt_%d_%d", time.Now().UnixNano(), rand.Intn(100000)),
+		ID:           "wlt_" + newID(),
 		UserID:       userID,
-		BalanceCents: 0,
+		BalanceCents: initialBalanceCents,
 		CreatedAt:    time.Now().UTC(),
 	}
-	if err := s.repo.CreateWallet(ctx, wallet); err != nil {
+	if err := s.repo.CreateWalletWithBalance(ctx, wallet); err != nil {
 		return domain.Wallet{}, err
-	}
-	if initialBalanceCents > 0 {
-		_, err := s.repo.Deposit(ctx, wallet.ID, initialBalanceCents, fmt.Sprintf("seed_%s", wallet.ID))
-		if err != nil {
-			return domain.Wallet{}, err
-		}
-		wallet.BalanceCents = initialBalanceCents
 	}
 	return wallet, nil
 }
 
 func (s *WalletService) GetBalance(ctx context.Context, walletID string) (domain.Wallet, error) {
-	return s.repo.GetWallet(ctx, walletID)
+	wallet, err := s.repo.GetWallet(ctx, walletID)
+	if err != nil {
+		return domain.Wallet{}, err
+	}
+	if err := s.assertOwnership(ctx, wallet); err != nil {
+		return domain.Wallet{}, err
+	}
+	return wallet, nil
 }
 
 func (s *WalletService) Deposit(ctx context.Context, walletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	if amountCents <= 0 {
 		return domain.Transaction{}, domain.ErrInvalidAmount
 	}
+	if err := s.requireWalletForSubject(ctx, walletID); err != nil {
+		return domain.Transaction{}, err
+	}
 	if requestID == "" {
-		requestID = fmt.Sprintf("deposit_%d", time.Now().UnixNano())
+		requestID = "deposit_" + newID()
 	}
 	return s.repo.Deposit(ctx, walletID, amountCents, requestID)
 }
@@ -63,10 +75,37 @@ func (s *WalletService) Withdraw(ctx context.Context, walletID string, amountCen
 	if amountCents <= 0 {
 		return domain.Transaction{}, domain.ErrInvalidAmount
 	}
+	if err := s.requireWalletForSubject(ctx, walletID); err != nil {
+		return domain.Transaction{}, err
+	}
 	if requestID == "" {
-		requestID = fmt.Sprintf("withdraw_%d", time.Now().UnixNano())
+		requestID = "withdraw_" + newID()
 	}
 	return s.repo.Withdraw(ctx, walletID, amountCents, requestID)
+}
+
+// assertOwnership enforces that an authenticated subject may only access
+// wallets they own. When no subject is present (unit tests, system calls)
+// the check is skipped. A foreign wallet is reported as "not found" so the
+// API does not reveal that the wallet exists at all.
+func (s *WalletService) assertOwnership(ctx context.Context, wallet domain.Wallet) error {
+	subject := SubjectFromContext(ctx)
+	if subject == "" || wallet.UserID == subject {
+		return nil
+	}
+	return domain.ErrWalletNotFound
+}
+
+// requireWalletForSubject is the ownership gate applied before mutation.
+func (s *WalletService) requireWalletForSubject(ctx context.Context, walletID string) error {
+	if SubjectFromContext(ctx) == "" {
+		return nil
+	}
+	wallet, err := s.repo.GetWallet(ctx, walletID)
+	if err != nil {
+		return err
+	}
+	return s.assertOwnership(ctx, wallet)
 }
 
 func (s *WalletService) Transfer(
@@ -86,26 +125,15 @@ func (s *WalletService) Transfer(
 			fmt.Errorf("from_wallet_id and to_wallet_id must be different")
 	}
 
+	// The sender must own the source wallet; the destination may belong to
+	// anyone (a payment is sent to another account's wallet).
+	if err := s.requireWalletForSubject(ctx, fromWalletID); err != nil {
+		return domain.Transaction{}, err
+	}
+
 	if requestID == "" {
-		requestID = fmt.Sprintf(
-			"transfer_%d",
-			time.Now().UnixNano(),
-		)
+		requestID = "transfer_" + newID()
 	}
-
-	// 20% slow request
-	if rand.Intn(100) < 20 {
-		time.Sleep(300 * time.Millisecond)
-	}
-
-	// 5% error
-	if rand.Intn(100) < 5 {
-		metrics.RecordTransfer(false)
-		return domain.Transaction{},
-			fmt.Errorf("simulated transfer failure")
-	}
-
-	metrics.RecordTransfer(true)
 
 	return s.repo.Transfer(
 		ctx,
@@ -123,6 +151,10 @@ func (s *WalletService) SeedWallets(ctx context.Context, users int, initialBalan
 	if initialBalanceCents <= 0 {
 		initialBalanceCents = 100000
 	}
+
+	// Seeding creates fleets of load-test wallets on behalf of any
+	// authenticated operator; it is a system operation, not personal funds.
+	ctx = WithoutSubject(ctx)
 
 	ids := make([]string, 0, users)
 	prefix := time.Now().UnixNano()
@@ -144,6 +176,10 @@ func (s *WalletService) SimulateTransfer(ctx context.Context, users int, amountC
 		amountCents = 100
 	}
 
+	// Simulation is a system-level load operation: pick any wallets in the
+	// fleet, regardless of which authenticated account ran it.
+	ctx = WithoutSubject(ctx)
+
 	walletIDs, err := s.repo.ListWalletIDs(ctx, int64(users))
 	if err != nil {
 		return domain.Transaction{}, err
@@ -158,7 +194,15 @@ func (s *WalletService) SimulateTransfer(ctx context.Context, users int, amountC
 		toIndex = rand.Intn(len(walletIDs))
 	}
 
-	return s.Transfer(ctx, walletIDs[fromIndex], walletIDs[toIndex], amountCents, fmt.Sprintf("sim_%d_%d", time.Now().UnixNano(), rand.Intn(1000000)))
+	return s.Transfer(ctx, walletIDs[fromIndex], walletIDs[toIndex], amountCents, "sim_"+newID())
+}
+
+func newID() string {
+	var value [16]byte
+	if _, err := cryptorand.Read(value[:]); err != nil {
+		panic(fmt.Sprintf("generate secure id: %v", err))
+	}
+	return hex.EncodeToString(value[:])
 }
 
 func (s *WalletService) CountWallets(ctx context.Context) (int64, error) {

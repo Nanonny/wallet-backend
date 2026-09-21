@@ -138,7 +138,7 @@ kubectl -n wallet-demo get pods -l app=wallet-api
 
 Self-hosted runner setup guide: `docs/self-hosted-runner.md`
 
-The deploy job applies `deploy/k8s/`, updates `deployment/wallet-api` to:
+The deploy job applies `deploy/k8s/` with Kustomize, updates `deployment/wallet-api` to:
 
 ```text
 DOCKERHUB_USERNAME/wallet-api@sha256:<digest>

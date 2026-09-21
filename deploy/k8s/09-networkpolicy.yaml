@@ -1,0 +1,57 @@
+# Network isolation for the wallet-demo namespace.
+#
+# Posture: default-deny ingress; pods inside the namespace are allowed to
+# reach each other (envoy->wallet-api, prometheus->wallet-api metrics,
+# grafana->prometheus, wallet-api->redis/postgres are egress, which this
+# policy set intentionally leaves open for portability).
+#
+# Notes:
+# - Minikube does not enforce NetworkPolicies (no CNI); this file documents
+#   intent and is enforced on clusters with a policy-aware CNI (Calico,
+#   Cilium, KubeRouter).
+# - On such clusters, also allow kubelet probes explicitly if your CNI
+#   blocks node-to-pod traffic (e.g. ipBlock 0.0.0.0/0 on 8080/50051/9090
+#   scoped to the wallet-api policy), or run probes via an agent sidecar.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: wallet-demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: wallet-demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    # User traffic: Envoy edge -> wallet-api (HTTP + gRPC)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - port: 8080
+        - port: 50051
+    # Scrape: Prometheus -> wallet-api /metrics (cluster-scoped only;
+    # never expose :9090 externally)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - port: 9090
+    # Dashboards: Grafana -> Prometheus
+    - from:
+        - podSelector:
+            matchLabels:
+              app: grafana
+      ports:
+        - port: 9090

@@ -1,6 +1,12 @@
 APP_NAME=wallet-api
 IMAGE_NAME=wallet-api:dev
 NAMESPACE=wallet-demo
+WALLET_BASE ?= http://localhost:8080
+
+# Local demo credentials used by the seed/load targets. For anything beyond
+# your machine, create your own account instead.
+DEMO_USERNAME ?= demo
+DEMO_PASSWORD ?= wallet-demo-1234
 
 # Docker Hub settings. Override these when running make, for example:
 # make dockerhub-build DOCKERHUB_USERNAME=yourname IMAGE_TAG=v1.0.0
@@ -9,7 +15,25 @@ DOCKERHUB_IMAGE?=$(DOCKERHUB_USERNAME)/$(APP_NAME)
 IMAGE_TAG?=latest
 IMAGE_DIGEST?=
 
-.PHONY: run run-memory grpc-client fmt-check vet test test-ci ci-local build docker-build dockerhub-build dockerhub-push vuln minikube-start minikube-image deploy deploy-dockerhub-image deploy-dockerhub-digest rollout-status delete port-forward-envoy port-forward-prometheus port-forward-grafana seed load-smoke load-normal load-high proto
+.PHONY: run run-memory grpc-client fmt-check vet test test-ci test-pg ci-local build docker-build dockerhub-build dockerhub-push vuln minikube-start minikube-image deploy deploy-dockerhub-image deploy-dockerhub-digest rollout-status delete port-forward-envoy port-forward-prometheus port-forward-grafana deps-up seed login demo-token load-smoke load-normal load-high proto
+
+# Starts the local dependency stack (Redis + PostgreSQL).
+deps-up:
+	docker compose up -d
+
+# Runs the Postgres-backed user repository integration tests against the
+# local compose postgres.
+TEST_POSTGRES_DSN ?= postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable
+test-pg:
+	TEST_POSTGRES_DSN=$(TEST_POSTGRES_DSN) go test -race -count=1 ./internal/adapters/postgres/ -v
+
+# Prints a bearer token for the local demo user (registers it first if
+# needed). Use: TOKEN=$$(make -s demo-token)
+demo-token:
+	@curl -s -X POST $(WALLET_BASE)/v1/auth/register -H "Content-Type: application/json" -d '{"username":"$(DEMO_USERNAME)","password":"$(DEMO_PASSWORD)"}' > /dev/null 2>&1; \
+	curl -sf -X POST $(WALLET_BASE)/v1/auth/login -H "Content-Type: application/json" \
+	  -d '{"username":"$(DEMO_USERNAME)","password":"$(DEMO_PASSWORD)"}' \
+	  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 
 run:
 	STORAGE=redis REDIS_ADDR=localhost:6379 go run ./cmd/wallet-api
@@ -56,7 +80,7 @@ minikube-image:
 	eval $$(minikube docker-env) && docker build -t $(IMAGE_NAME) .
 
 deploy:
-	kubectl apply -f deploy/k8s/
+	kubectl apply -k deploy/k8s/
 
 # Use this after GitHub Actions has pushed the image to Docker Hub.
 # Example:
@@ -74,7 +98,7 @@ rollout-status:
 	kubectl -n $(NAMESPACE) rollout status deployment/wallet-api
 
 delete:
-	kubectl delete -f deploy/k8s/ --ignore-not-found=true
+	kubectl delete -k deploy/k8s/ --ignore-not-found=true
 
 port-forward-envoy:
 	kubectl -n $(NAMESPACE) port-forward svc/envoy 8080:8080 50051:50051
@@ -85,25 +109,33 @@ port-forward-prometheus:
 port-forward-grafana:
 	kubectl -n $(NAMESPACE) port-forward svc/grafana 3000:3000
 
+login:
+	@echo "demo-token=$$(make -s demo-token)"
+
 seed:
-	curl -X POST http://localhost:8080/v1/simulate/seed \
+	@TOKEN=$$(make -s demo-token); \
+	curl -X POST $(WALLET_BASE)/v1/simulate/seed \
 	  -H "Content-Type: application/json" \
+	  -H "Authorization: Bearer $$TOKEN" \
 	  -d '{"users":1000,"initial_balance_cents":100000}'
 
 load-smoke:
-	hey -n 100 -c 5 -m POST -H "Content-Type: application/json" \
+	@TOKEN=$$(make -s demo-token); \
+	hey -n 100 -c 5 -m POST -H "Content-Type: application/json" -H "Authorization: Bearer $$TOKEN" \
 	  -d '{"users":100,"amount_cents":100}' \
-	  http://localhost:8080/v1/simulate/transfer
+	  $(WALLET_BASE)/v1/simulate/transfer
 
 load-normal:
-	hey -z 30s -c 20 -q 2 -m POST -H "Content-Type: application/json" \
+	@TOKEN=$$(make -s demo-token); \
+	hey -z 30s -c 20 -q 2 -m POST -H "Content-Type: application/json" -H "Authorization: Bearer $$TOKEN" \
 	  -d '{"users":500,"amount_cents":100}' \
-	  http://localhost:8080/v1/simulate/transfer
+	  $(WALLET_BASE)/v1/simulate/transfer
 
 load-high:
-	hey -z 60s -c 50 -q 2 -m POST -H "Content-Type: application/json" \
+	@TOKEN=$$(make -s demo-token); \
+	hey -z 60s -c 50 -q 2 -m POST -H "Content-Type: application/json" -H "Authorization: Bearer $$TOKEN" \
 	  -d '{"users":1000,"amount_cents":100}' \
-	  http://localhost:8080/v1/simulate/transfer
+	  $(WALLET_BASE)/v1/simulate/transfer
 
 # Production protobuf generation path.
 # This scaffold runs immediately with a grpc-go JSON codec, but keep this target
