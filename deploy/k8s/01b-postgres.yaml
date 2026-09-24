@@ -33,6 +33,10 @@ spec:
         runAsNonRoot: true
         runAsUser: 70
         runAsGroup: 70
+        # fsGroup makes dynamically provisioned volumes (e.g. Azure managed
+        # disks) group-writable for the postgres user, so initdb works on a
+        # fresh empty volume without a root-owned hostPath directory.
+        fsGroup: 70
         seccompProfile:
           type: RuntimeDefault
       containers:
