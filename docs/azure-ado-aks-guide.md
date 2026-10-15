@@ -203,6 +203,59 @@ done
 **ผลลัพธ์ที่คาด**: 3 pod แต่ละคนรับ ~33% (5000 → ~1600/1700/1700, ±5%) = Envoy round-robin ทำงานจริง  
 ถ้า pod ใด 0 → bug (ดู step 9 ว่า image/desiredReplicas ถูกต้อง, `kubectl -n wallet-demo get endpoints wallet-api-headless` ต้องมี 3 pod IP)
 
+## 10.5 วัดตัวเลขสำหรับรายงาน (X req/s, Y ms p95, A% → B%)
+
+> ใช้ protocol นี้เพื่อได้ตัวเลขจริงทุกช่องในประโยครายงาน
+> พื้นหลัง: wallet ทั้งหมดอยู่ใน **redis** — ถ้า redis ตาย = `SPOF` → wallet reads ทั้ง 100% เป็น 5xx
+> (`writeError` default = 500) และ `/readyz` จริงๆ เรียก redis (`SCARD wallets`)
+> → probe `periodSeconds:10 × failureThreshold:3` = pod ถูกถอดจาก LB ใน ~10-40 วินาที
+
+**A) Baseline (ระบบปกติ) — จับ X + Y + error baseline**
+```bash
+IP=$(kubectl -n wallet-demo get svc envoy -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+URL="http://$IP/v1/wallets/$WID/balance"
+HE="Authorization: Bearer $TOKEN"
+
+hey -n 2000 -c 30 "$URL" -H "$HE"
+```
+อ่านจาก output ของ hey:
+- บรรทัด `Requests/sec: ...` → **X** (req/s)
+- ตาราง `Latency distribution` → บรรทัด `95%` → **Y** (ms)
+- `Error rate: 0.00%` → baseline
+
+**B) Simulate failure: kill wallet store (redis)**
+```bash
+kubectl -n wallet-demo scale deployment/redis --replicas=0
+sleep 10        # รอ go-redis report connection refused ทันที
+hey -n 2000 -c 30 "$URL" -H "$HE" | grep -E "Requests/sec|95%|Error rate"
+# → Error rate ≈ 100% (5xx)   ← นี่คือ A%
+```
+
+**C) Recover + rerun — จับ B% + เวลาฟื้นตัว**
+```bash
+t0=$(date)
+kubectl -n wallet-demo scale deployment/redis --replicas=1
+kubectl -n wallet-demo rollout status deployment/redis --timeout=120s
+for i in $(seq 1 30); do
+  kubectl -n wallet-demo get pods -l app=wallet-api \
+    -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+    | grep -q False || break
+  sleep 5
+done
+echo "recovered in $(( $(date) - t0 ))s"
+hey -n 2000 -c 30 "$URL" -H "$HE" | grep -E "Requests/sec|95%|Error rate"
+# → Error rate 0.00%, p95 กลับระดับ baseline   ← นี่คือ B%
+```
+
+**D) ประโยครายงาน (ใส่ตัวเลขจริงของคุณแทน — ตัวเลขในวงเล็บคือตัวอย่างสมมติ)**
+> Load tested at **~700 req/s** with p95 latency of **~45 ms**; simulated a wallet-store outage
+> (single-Redis SPOF — 100% of wallet reads returned 5xx while the API kept serving), found the
+> failure mode = shared single-instance dependency, resolved by controller auto-restart plus
+> readiness-driven load-balancer ejection (`/readyz` probes the store; production: HA/managed cache),
+> bringing error rate from **100%** to **0.00%** in under ~40 s of recovery.
+
+ช่องที่ต้องมีตัวเลขจริง: X (จาก A) • Y (จาก A) • A% (จาก B) • B% + recovery time (จาก C)
+
 ## 11. (ทางเลือก) ดูกราฟ Grafana
 
 `kubectl -n wallet-demo port-forward svc/grafana 3000:3000` → เปิด http://127.0.0.1:3000 → panel `sum by (pod) (rate(wallet_http_requests_total[1m]))` — ดูเส้นสามเส้นแยกกันชัดๆ
