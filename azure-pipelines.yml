@@ -9,10 +9,11 @@
 #      (Authentication method: Service principal, role: Contributor on the
 #       target subscription — ADO can create the SP for you in the wizard)
 #   2. Variable group (Pipelines -> Libraries) named:  wallet-azure-vars
-#        ACR_NAME          walletlab
-#        ACR_LOGIN_SERVER  walletlab.azurecr.io
-#        AKS_NAME          wallet-aks
-#        RG                wallet-lab-rg
+#        ACR_NAME               walletlab
+#        ACR_LOGIN_SERVER       walletlab.azurecr.io
+#        AKS_NAME               wallet-aks
+#        RG                     wallet-lab-rg
+#        ACR_PUSH_PRINCIPAL_ID  <object id of the wallet-azure SP>
 #
 # Secrets: none stored in this repo — auth flows through the ARM service
 # connection's Service Principal.
@@ -84,6 +85,35 @@ stages:
               set -eu
               docker build -t wallet-api:ci .
             displayName: "Validate Docker build"
+
+  - stage: infra
+    displayName: "Infra - Terraform (RG + ACR + AKS)"
+    jobs:
+      - job: provision
+        variables:
+          - group: wallet-azure-vars
+        steps:
+          # Authenticates via the ARM service connection `wallet-azure`
+          # (the same SP used by the CD stage). The Terraform task reads the
+          # service connection's SP and exposes it to the azurerm provider.
+          - task: Terraform@0
+            displayName: "Terraform init + apply"
+            inputs:
+              provider: "azurerm"
+              azureSubscription: "wallet-azure"
+              workingDirectory: $(System.DefaultWorkingDirectory)/infra
+              command: "apply"
+              terraformVersion: "1.9.5"
+              azurermVersion: "4.35.0"
+              csiDriverType: "AzureDisk"
+              azurerm_features: "{}"
+              acctest: false
+              tfvars: |
+                resource_group    = "$(RG)"
+                location          = "southeastasia"
+                acr_name          = "$(ACR_NAME)"
+                acr_push_principal_id = "$(ACR_PUSH_PRINCIPAL_ID)"
+                aks_name          = "$(AKS_NAME)"
 
   - stage: cd
     displayName: "CD - push ACR & deploy AKS"

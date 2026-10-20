@@ -69,6 +69,8 @@
    → Role: **Contributor** → เลือก subscription → (ADO สร้าง SP + secret ให้เอง)
 8. Description: `pipeline SP` → **Save**  
    (ถ้า wizard ให้ "Verify & authorize" ก็ให้ผ่าน — ADO สร้าง SP ใน Azure ให้)
+9. **บันทึก `Service principal (client) ID`** — เปิดหน้า edit ของ connection นี้:
+   ฟิลด์ `Service principal (client) ID` (uuid 32 ตัว) → ใช้เติม variable group ในขั้น 5
 
 ## 5. Variable group — browser
 
@@ -84,29 +86,28 @@
    | `ACR_LOGIN_SERVER` | `walletlab.azurecr.io` |
    | `AKS_NAME` | `wallet-aks` |
    | `RG` | `wallet-lab-rg` |
+   | `ACR_PUSH_PRINCIPAL_ID` | `<Service principal (client) ID จากขั้น 4>` |
 
 4. **Save** → (tick เลือกให้ทุก job ใช้ก็ได้ ไม่บังคับ — yaml attach อยู่แล้ว)
 
-## 6. สร้าง Azure resources — terminal
+## 6. Terraform Infrastructure as Code — ไม่ต้องรันอะไรเอง
 
-```bash
-# Resource group (region: ไทย/ping ต่ำ)
-~/azcli/bin/az group create -n wallet-lab-rg -l southeastasia
+> Pipeline stage `infra` จะรัน `terraform init + apply` ด้วยตัวเองจากไฟล์
+> `infra/main.tf` (สร้าง RG + ACR + AKS + role binding ครบ)
+> คุณแค่เช็คให้ variable group ในขั้น 5 ครบ โดยเฉพาะ `ACR_PUSH_PRINCIPAL_ID`
 
-# Azure Container Registry (Basic ~ฟรี)
-~/azcli/bin/az acr create -n walletlab -g wallet-lab-rg --sku Basic --admin-enabled true
-~/azcli/bin/az acr show -n walletlab -g wallet-lab-rg --query loginServer -o tsv   # ควรได้ walletlab.azurecr.io
+Terraform จะสร้างอะไรให้:
 
-# AKS — ใช้เวลา ~10-15 นาที (เปิด terminal นี้ค้างไว้ หรือ -d + poll ได้)
-~/azcli/bin/az aks create -n wallet-aks -g wallet-lab-rg \
-  --node-count 1 --node-vm-size Standard_D2s_v3 \
-  --generate-ssh-keys
-```
+| Resource | Name | Note |
+|---|---|---|
+| Resource Group | `wallet-lab-rg` | Location: `southeastasia` |
+| Container Registry (Basic) | `walletlab` | `admin_user_enabled=true` |
+| Role assignment | `AcrPush` | ให้ SP ของ pipeline (`ACR_PUSH_PRINCIPAL_ID`) push ได้ |
+| AKS cluster (1.33) | `wallet-aks` | 1 node `Standard_D2s_v3` |
+| Role assignment | `AcrPull` | ให้ AKS control plane pull image ได้ |
 
-ระหว่างรอก็ไปทำ step 7-8 ก่อนได้เลย; ตรวจตอนเสร็จ:
-```bash
-~/azcli/bin/az aks show -n wallet-aks -g wallet-lab-rg --query provisioningState -o tsv   # Succeeded
-```
+Terraform state ใช้ local backend (`infra/terraform.tfstate`) สำหรับ lab
+(ถ้าจะเอา production — สลับไป Azure Storage backend ดูคอมเมนต์ใน `infra/backend.tf`)
 
 ## 7. Push โค้ดขึ้น main — terminal
 
@@ -136,6 +137,7 @@ git -c credential.helper='!f() { echo "username=Nanonny"; echo "password=${GH_TO
 4. **Save & Run**
 5. ดู Runs — ลำดับที่คาดหวัง:
    - `CI - test & verify` (~3-5 นาที): install go 1.26.6, gofmt, tidy, vet, `test -race` + redis service, docker build check
+   - `infra - Terraform` (ครั้งแรก ~10-15 นาที / ครั้งหลัง <5 นาที): สร้าง/ตรวจสอบ RG + ACR + AKS + role binding
    - `CD - push ACR & deploy AKS` (~5-10 นาที): build image → push `walletlab/wallet-api:sha-<short>` → `apply -k` + set image + envoy → LoadBalancer → rollout → smoke test `/healthz` + `/login`
 
   ถ้า fail: เปิด log ของ step ที่ขึ้นแดง — จุดที่พบบ่อยคือชื่อ service connection/variable group ไม่ตรง step 4-5
@@ -274,6 +276,7 @@ hey -n 2000 -c 30 "$URL" -H "$HE" | grep -E "Requests/sec|95%|Error rate"
 | อาการ | สาเหตุ/แก้ |
 |---|---|
 | CD fail ที่ "SP login" | ชื่อ service connection ≠ `wallet-azure` หรือ SP ไม่มี role Contributor → จัดการใหม่ step 4 |
+| infra stage fail (terraform) | ขาด credentials / SP ใน `wallet-azure-vars` ครบไม่ครบ — ดู error ของ variable `ACR_PUSH_PRINCIPAL_ID` ก่อน |
 | docker push 401 | ACR admin-enabled ไม่เคยเปิด → `az acr update -n walletlab -g wallet-lab-rg --admin-enabled true` |
 | postgres pod CrashLoop (permissions) | managed disk ยังไม่ respect `fsGroup` — บอกผม ผมจะ patch initContainer chown 70:70 ให้ |
 | AKS pod อืด/ไม่ขึ้น | `kubectl -n wallet-demo describe pod <pod>` ดู reason; node 1 ตัวอาจ tight — ดู `kubectl top nodes` |
