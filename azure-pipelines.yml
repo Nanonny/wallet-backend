@@ -123,8 +123,18 @@ stages:
                 -p "$(TFARM_CLIENT_SECRET)" \
                 --tenant "$(TFARM_TENANT_ID)"
               if az group show --name "$(RG)" >/dev/null 2>&1; then
-                echo ">> RG '$(RG)' already exists — skipping Terraform (idempotent)"
-                exit 0
+                # Partial state check: RG exists -> ACR and AKS must exist too,
+                # otherwise a previous apply failed midway. Fail loudly instead
+                # of skipping and letting CD try to use a missing ACR.
+                if az acr show --name "$(ACR_NAME)" --resource-group "$(RG)" >/dev/null 2>&1 \
+                   && az aks show --name "$(AKS_NAME)" --resource-group "$(RG)" >/dev/null 2>&1; then
+                  echo ">> RG '$(RG)' already exists with ACR + AKS — skipping Terraform (idempotent)"
+                  exit 0
+                fi
+                echo "##[error]RG '$(RG)' exists but ACR '$(ACR_NAME)' and/or AKS '$(AKS_NAME)' are missing in it."
+                echo "##[error]A previous apply failed midway. Check the portal, then either finish manually or"
+                echo "##[error]delete the partial state: az group delete --name '$(RG)' --yes  (and re-run)."
+                exit 1
               fi
               echo ">> ensure terraform CLI"
               terraform --version 2>/dev/null || {
@@ -148,6 +158,7 @@ stages:
     displayName: "CD - push ACR & deploy AKS"
     dependsOn:
       - ci
+      - infra
     condition: succeeded()
     jobs:
       - job: deploy
