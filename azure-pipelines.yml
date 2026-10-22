@@ -122,6 +122,30 @@ stages:
                 -u "$(TFARM_CLIENT_ID)" \
                 -p "$(TFARM_CLIENT_SECRET)" \
                 --tenant "$(TFARM_TENANT_ID)"
+
+              # Ensure the required resource providers are registered on this
+              # subscription (MissingSubscriptionRegistration happens on some
+              # fresh/consumer subscriptions). Registration is async — poll.
+              reg_provider() {
+                local p="$1" s
+                s="$(az provider show -n "$p" --query registrationState -o tsv 2>/dev/null || echo Unknown)"
+                if [ "$s" != "Registered" ]; then
+                  echo "   provider $p is '$s' -> registering"
+                  az provider register -n "$p" || echo "   register returned non-zero (may still be in progress)"
+                fi
+              }
+              reg_provider Microsoft.ContainerRegistry
+              reg_provider Microsoft.ContainerService
+              ok=0
+              for i in $(seq 1 36); do
+                s1="$(az provider show -n Microsoft.ContainerRegistry --query registrationState -o tsv 2>/dev/null)"
+                s2="$(az provider show -n Microsoft.ContainerService --query registrationState -o tsv 2>/dev/null)"
+                if [ "$s1" = "Registered" ] && [ "$s2" = "Registered" ]; then ok=1; break; fi
+                echo "   waiting for provider registration... ($s1 / $s2)"
+                sleep 10
+              done
+              [ "$ok" = "1" ] || { echo "##[error]resource providers not Registered after 6 min — see aka.ms/rps-not-found"; exit 1; }
+              echo ">> providers registered"
               if az group show --name "$(RG)" >/dev/null 2>&1; then
                 # Partial state check: RG exists -> ACR and AKS must exist too,
                 # otherwise a previous apply failed midway. Fail loudly instead
