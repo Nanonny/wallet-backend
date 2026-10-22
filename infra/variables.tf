@@ -16,11 +16,6 @@ variable "acr_name" {
   default     = "walletlab"
 }
 
-variable "acr_push_principal_id" {
-  description = "Object ID of the ADO pipeline's Service Principal (the ARM service connection `wallet-azure`). It gets AcrPush on the registry."
-  type        = string
-}
-
 variable "aks_name" {
   description = "AKS cluster name."
   type        = string

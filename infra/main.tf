@@ -39,14 +39,6 @@ resource "azurerm_container_registry" "wallet" {
   admin_enabled       = true
 }
 
-# The ARM service connection SP (created in ADO) needs ACR Contributor so
-# `az acr login` + `docker push` from the pipeline works.
-resource "azurerm_role_assignment" "acr_push" {
-  scope                = azurerm_container_registry.wallet.id
-  role_definition_name = "AcrPush"
-  principal_id         = var.acr_push_principal_id
-}
-
 # ---------------------------------------------------------------------------
 # AKS cluster
 # ---------------------------------------------------------------------------
@@ -54,7 +46,10 @@ resource "azurerm_kubernetes_cluster" "wallet" {
   name                = var.aks_name
   resource_group_name = azurerm_resource_group.wallet.name
   location            = azurerm_resource_group.wallet.location
-  kubernetes_version  = "1.33"
+  # 1.37 is the latest version in this region whose SupportPlan includes
+  # "KubernetesOfficial" (standard support, no extra cost). Older versions
+  # (1.3x) have moved to "AKSLongTermSupport" (requires a license/paid add-on).
+  kubernetes_version  = "1.37.0"
   dns_prefix          = "wallet"
   # Public API server: the ADO hosted agent needs to reach it.
   # For private, wire an outbound NAT / ADO self-hosted runner with a VNet.
@@ -71,13 +66,11 @@ resource "azurerm_kubernetes_cluster" "wallet" {
   azure_policy_enabled = true
 }
 
-# Allow the AKS control plane to reach the ACR without any credentials
-# (image pulls in the pipeline + inside the cluster will work).
-resource "azurerm_role_assignment" "aks_pull" {
-  scope                = azurerm_container_registry.wallet.id
-  role_definition_name = "AcrPull"
-  principal_id         = azurerm_kubernetes_cluster.wallet.identity[0].principal_id
-}
+# NOTE: no azurerm_role_assignment here. This lab uses a consumer subscription
+# which does not permit `Microsoft.Authorization/roleAssignments/write`, so
+# role-based ACR access (AcrPush/AcrPull) is not possible. Instead:
+#   - the pipeline pushes with the ACR admin user (admin_enabled = true),
+#   - the pipeline seeds a docker-registry imagePullSecret into the cluster.
 
 output "acr_login_server" {
   value = azurerm_container_registry.wallet.login_server
