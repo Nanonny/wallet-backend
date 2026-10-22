@@ -107,7 +107,17 @@ stages:
           # so if the resource group already exists we skip apply.
           - script: |
               set -eu
-              echo ">> SP login (for az + azurerm provider)"
+              # --- fast-fail with a clear message if the SP variables are missing/empty
+              [ -n "$(TFARM_CLIENT_ID)" ]        || { echo "##[error]TFARM_CLIENT_ID is empty — add it to wallet-azure-vars"; exit 1; }
+              [ -n "$(TFARM_CLIENT_SECRET)" ]    || { echo "##[error]TFARM_CLIENT_SECRET is empty — add to wallet-azure-vars and tick SECRET in ADO"; exit 1; }
+              [ -n "$(TFARM_TENANT_ID)" ]        || { echo "##[error]TFARM_TENANT_ID is empty — must be the tenant UUID (Directory (tenant) ID), not 'common'/'organizations'/'v2.0'"; exit 1; }
+              [ -n "$(TFARM_SUB_ID)" ]           || { echo "##[error]TFARM_SUB_ID is empty"; exit 1; }
+              [ -n "$(ACR_PUSH_PRINCIPAL_ID)" ]  || { echo "##[error]ACR_PUSH_PRINCIPAL_ID is empty"; exit 1; }
+              case "$(TFARM_TENANT_ID)" in
+                *-*) : ;;  # looks UUID-ish
+                *)   echo "##[error]TFARM_TENANT_ID does not look like a UUID: $(TFARM_TENANT_ID)"; exit 1 ;;
+              esac
+              echo ">> SP login (azurerm creds for Terraform)"
               az login --service-principal \
                 -u "$(TFARM_CLIENT_ID)" \
                 -p "$(TFARM_CLIENT_SECRET)" \
