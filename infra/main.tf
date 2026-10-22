@@ -3,7 +3,11 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = ">= 3.60"
+      # Pinned on purpose: azurerm 4.x changed the schema (dropped
+      # `admin_user_enabled` on container registries and
+      # `default_node_pool` on AKS). 3.x is the stable, known-good schema
+      # for this module, and pinning keeps `terraform init` deterministic.
+      version = "3.117.1"
     }
   }
 }
@@ -80,7 +84,7 @@ output "acr_login_server" {
 }
 
 output "aks_fqdn" {
-  value = azurerm_kubernetes_cluster.wallet.kubernetes_service_endpoint
+  value = azurerm_kubernetes_cluster.wallet.kube_api_endpoint
 }
 
 output "subscription_id" {
