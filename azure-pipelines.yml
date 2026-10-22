@@ -139,7 +139,10 @@ stages:
               echo ">> ensure terraform CLI"
               terraform --version 2>/dev/null || {
                 curl -fsSL "https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_amd64.zip" -o /tmp/tf.zip
-                ( cd /tmp && python3 -m zipfile -e tf.zip . && sudo cp terraform /usr/local/bin/ )
+                # python -m zipfile extract does NOT preserve exec bits -> chmod 755
+                ( cd /tmp && python3 -m zipfile -e tf.zip . \
+                  && sudo cp terraform /usr/local/bin/ \
+                  && sudo chmod 755 /usr/local/bin/terraform )
               }
               terraform version
               echo ">> terraform init + apply (infra/)"
