@@ -13,7 +13,11 @@
 #        ACR_LOGIN_SERVER       walletlab.azurecr.io
 #        AKS_NAME               wallet-aks
 #        RG                     wallet-lab-rg
-#        ACR_PUSH_PRINCIPAL_ID  <object id of the wallet-azure SP>
+#        ACR_PUSH_PRINCIPAL_ID  <client id of the wallet-azure SP>
+#        TFARM_CLIENT_ID        <same SP client id>
+#        TFARM_TENANT_ID        <tenant id>
+#        TFARM_SUB_ID           <subscription id>
+#        TFARM_CLIENT_SECRET    <client secret — marked SECRET in ADO>
 #
 # Secrets: none stored in this repo — auth flows through the ARM service
 # connection's Service Principal.
@@ -93,27 +97,42 @@ stages:
         variables:
           - group: wallet-azure-vars
         steps:
-          # Authenticates via the ARM service connection `wallet-azure`
-          # (the same SP used by the CD stage). The Terraform task reads the
-          # service connection's SP and exposes it to the azurerm provider.
-          - task: Terraform@0
-            displayName: "Terraform init + apply"
-            inputs:
-              provider: "azurerm"
-              azureSubscription: "wallet-azure"
-              workingDirectory: $(System.DefaultWorkingDirectory)/infra
-              command: "apply"
-              terraformVersion: "1.9.5"
-              azurermVersion: "4.35.0"
-              csiDriverType: "AzureDisk"
-              azurerm_features: "{}"
-              acctest: false
-              tfvars: |
-                resource_group    = "$(RG)"
-                location          = "southeastasia"
-                acr_name          = "$(ACR_NAME)"
-                acr_push_principal_id = "$(ACR_PUSH_PRINCIPAL_ID)"
-                aks_name          = "$(AKS_NAME)"
+          # NOTE: uses plain `az login` + `terraform` CLI (both pre-installed on
+          # ADO-hosted ubuntu-latest) instead of the third-party `Terraform@0`
+          # marketplace task, which is not present in every ADO org.
+          # SP credentials come from the `wallet-azure-vars` group
+          # (TFARM_CLIENT_ID / TFARM_CLIENT_SECRET / TFARM_TENANT_ID /
+          #  TFARM_SUB_ID — the same SP as the `wallet-azure` service connection).
+          # Idempotency: ADO hosted agents are stateless (no Terraform state),
+          # so if the resource group already exists we skip apply.
+          - script: |
+              set -eu
+              echo ">> SP login (for az + azurerm provider)"
+              az login --service-principal \
+                -u "$(TFARM_CLIENT_ID)" \
+                -p "$(TFARM_CLIENT_SECRET)" \
+                --tenant "$(TFARM_TENANT_ID)"
+              if az group show --name "$(RG)" >/dev/null 2>&1; then
+                echo ">> RG '$(RG)' already exists — skipping Terraform (idempotent)"
+                exit 0
+              fi
+              echo ">> ensure terraform CLI"
+              terraform --version 2>/dev/null || {
+                curl -fsSL "https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_amd64.zip" -o /tmp/tf.zip
+                ( cd /tmp && python3 -m zipfile -e tf.zip . && sudo cp terraform /usr/local/bin/ )
+              }
+              terraform version
+              echo ">> terraform init + apply (infra/)"
+              cd infra
+              export ARM_CLIENT_ID="$(TFARM_CLIENT_ID)"
+              export ARM_CLIENT_SECRET="$(TFARM_CLIENT_SECRET)"
+              export ARM_TENANT_ID="$(TFARM_TENANT_ID)"
+              export ARM_SUBSCRIPTION_ID="$(TFARM_SUB_ID)"
+              export ARM_SKIP_PROVIDER_REGISTRATION=true
+              TF_VAR_acr_push_principal_id="$(ACR_PUSH_PRINCIPAL_ID)" terraform init
+              TF_VAR_acr_push_principal_id="$(ACR_PUSH_PRINCIPAL_ID)" terraform apply -auto-approve
+              terraform output
+            displayName: "Terraform: init + apply (azurerm via SP)"
 
   - stage: cd
     displayName: "CD - push ACR & deploy AKS"

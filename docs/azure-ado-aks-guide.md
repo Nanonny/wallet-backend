@@ -78,15 +78,19 @@
 
 1. เมนูซ้าย **Pipelines → Libraries → New** → ประเภท **Variable group**
 2. ชื่อ: `wallet-azure-vars`
-3. เพิ่มตัวแปร 4 ตัว (ทุกตัวไม่ต้อง tick "secret"):
+3. เพิ่มตัวแปร (9 ตัว — ตัว `TFARM_CLIENT_SECRET` ต้องติ๊ก **Secret**):
 
-   | Name | Value |
-   |---|---|
-   | `ACR_NAME` | `walletlab` |
-   | `ACR_LOGIN_SERVER` | `walletlab.azurecr.io` |
-   | `AKS_NAME` | `wallet-aks` |
-   | `RG` | `wallet-lab-rg` |
-   | `ACR_PUSH_PRINCIPAL_ID` | `<Service principal (client) ID จากขั้น 4>` |
+   | Name | Value | Secret? |
+   |---|---|---|
+   | `ACR_NAME` | `walletlab` | no |
+   | `ACR_LOGIN_SERVER` | `walletlab.azurecr.io` | no |
+   | `AKS_NAME` | `wallet-aks` | no |
+   | `RG` | `wallet-lab-rg` | no |
+   | `ACR_PUSH_PRINCIPAL_ID` | `<client id ของ SP>` | no |
+   | `TFARM_CLIENT_ID` | `<client id เดียวกัน>` | no |
+   | `TFARM_TENANT_ID` | `<tenant id>` | no |
+   | `TFARM_SUB_ID` | `<subscription id>` | no |
+   | `TFARM_CLIENT_SECRET` | `<client secret (Value)>` | **Yes** |
 
 4. **Save** → (tick เลือกให้ทุก job ใช้ก็ได้ ไม่บังคับ — yaml attach อยู่แล้ว)
 
