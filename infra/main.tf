@@ -36,7 +36,7 @@ resource "azurerm_container_registry" "wallet" {
   resource_group_name = azurerm_resource_group.wallet.name
   location            = azurerm_resource_group.wallet.location
   sku                 = "Basic"
-  admin_user_enabled  = true
+  admin_enabled       = true
 }
 
 # The ARM service connection SP (created in ADO) needs ACR Contributor so
@@ -84,7 +84,7 @@ output "acr_login_server" {
 }
 
 output "aks_fqdn" {
-  value = azurerm_kubernetes_cluster.wallet.kube_api_endpoint
+  value = azurerm_kubernetes_cluster.wallet.fqdn
 }
 
 output "subscription_id" {
