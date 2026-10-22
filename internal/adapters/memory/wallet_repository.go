@@ -14,6 +14,7 @@ type WalletRepository struct {
 	wallets        map[string]domain.Wallet
 	transactions   map[string]domain.Transaction
 	requestIDToTxn map[string]string
+	requestHashes  map[string]string
 }
 
 func NewWalletRepository() *WalletRepository {
@@ -21,7 +22,12 @@ func NewWalletRepository() *WalletRepository {
 		wallets:        map[string]domain.Wallet{},
 		transactions:   map[string]domain.Transaction{},
 		requestIDToTxn: map[string]string{},
+		requestHashes:  map[string]string{},
 	}
+}
+
+func (r *WalletRepository) CreateWalletWithBalance(ctx context.Context, wallet domain.Wallet) error {
+	return r.CreateWallet(ctx, wallet)
 }
 
 func (r *WalletRepository) CreateWallet(ctx context.Context, wallet domain.Wallet) error {
@@ -44,8 +50,9 @@ func (r *WalletRepository) GetWallet(ctx context.Context, walletID string) (doma
 func (r *WalletRepository) Deposit(ctx context.Context, walletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if txID, ok := r.requestIDToTxn[requestID]; ok {
-		return r.transactions[txID], nil
+	fingerprint := requestFingerprint(domain.TransactionDeposit, "", walletID, amountCents)
+	if tx, handled, err := r.duplicateRequest(requestID, fingerprint); handled {
+		return tx, err
 	}
 	w, ok := r.wallets[walletID]
 	if !ok {
@@ -56,14 +63,16 @@ func (r *WalletRepository) Deposit(ctx context.Context, walletID string, amountC
 	tx := newTransaction(domain.TransactionDeposit, "", walletID, amountCents, "deposit success")
 	r.transactions[tx.ID] = tx
 	r.requestIDToTxn[requestID] = tx.ID
+	r.requestHashes[requestID] = fingerprint
 	return tx, nil
 }
 
 func (r *WalletRepository) Withdraw(ctx context.Context, walletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if txID, ok := r.requestIDToTxn[requestID]; ok {
-		return r.transactions[txID], nil
+	fingerprint := requestFingerprint(domain.TransactionWithdraw, walletID, "", amountCents)
+	if tx, handled, err := r.duplicateRequest(requestID, fingerprint); handled {
+		return tx, err
 	}
 	w, ok := r.wallets[walletID]
 	if !ok {
@@ -77,14 +86,16 @@ func (r *WalletRepository) Withdraw(ctx context.Context, walletID string, amount
 	tx := newTransaction(domain.TransactionWithdraw, walletID, "", amountCents, "withdraw success")
 	r.transactions[tx.ID] = tx
 	r.requestIDToTxn[requestID] = tx.ID
+	r.requestHashes[requestID] = fingerprint
 	return tx, nil
 }
 
 func (r *WalletRepository) Transfer(ctx context.Context, fromWalletID string, toWalletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if txID, ok := r.requestIDToTxn[requestID]; ok {
-		return r.transactions[txID], nil
+	fingerprint := requestFingerprint(domain.TransactionTransfer, fromWalletID, toWalletID, amountCents)
+	if tx, handled, err := r.duplicateRequest(requestID, fingerprint); handled {
+		return tx, err
 	}
 	from, ok := r.wallets[fromWalletID]
 	if !ok {
@@ -104,7 +115,23 @@ func (r *WalletRepository) Transfer(ctx context.Context, fromWalletID string, to
 	tx := newTransaction(domain.TransactionTransfer, fromWalletID, toWalletID, amountCents, "transfer success")
 	r.transactions[tx.ID] = tx
 	r.requestIDToTxn[requestID] = tx.ID
+	r.requestHashes[requestID] = fingerprint
 	return tx, nil
+}
+
+func (r *WalletRepository) duplicateRequest(requestID, fingerprint string) (domain.Transaction, bool, error) {
+	txID, ok := r.requestIDToTxn[requestID]
+	if !ok {
+		return domain.Transaction{}, false, nil
+	}
+	if r.requestHashes[requestID] != fingerprint {
+		return domain.Transaction{}, true, domain.ErrIdempotencyConflict
+	}
+	return r.transactions[txID], true, nil
+}
+
+func requestFingerprint(txType, from, to string, amount int64) string {
+	return fmt.Sprintf("%s|%s|%s|%d", txType, from, to, amount)
 }
 
 func (r *WalletRepository) ListWalletIDs(ctx context.Context, limit int64) ([]string, error) {

@@ -34,12 +34,22 @@ concurrency:
 
 env:
   IMAGE_NAME: wallet-api
-  GO_VERSION: "1.26.4"
+  GO_VERSION: "1.26.6"
 
 jobs:
   ci:
     name: CI - Test, Scan, and Build
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
 
     steps:
       - name: Checkout source code
@@ -72,6 +82,8 @@ jobs:
         run: go vet ./...
 
       - name: Run unit tests with race detector and coverage
+        env:
+          REDIS_TEST_ADDR: localhost:6379
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Upload coverage artifact
@@ -89,6 +101,12 @@ jobs:
           go-version-input: ${{ env.GO_VERSION }}
           go-package: ./...
           repo-checkout: false
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Render Kubernetes manifests
+        run: kustomize build deploy/k8s > /tmp/wallet-manifests.yaml
 
       - name: Build Docker image locally for CI validation
         run: docker build -t ${{ env.IMAGE_NAME }}:ci .
@@ -157,8 +175,44 @@ jobs:
           provenance: true
           sbom: true
 
+  gitops-update:
+    name: CD - Update image for Argo CD
+    runs-on: ubuntu-latest
+    needs: dockerhub
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Update immutable image tag
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          cd deploy/k8s
+          kustomize edit set image wallet-api="${DOCKERHUB_USERNAME}/wallet-api:sha-${GITHUB_SHA::7}"
+
+      - name: Commit GitOps manifest
+        run: |
+          if git diff --quiet -- deploy/k8s/kustomization.yaml; then
+            echo "GitOps manifest already points to this image."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/k8s/kustomization.yaml
+          git commit -m "chore(gitops): deploy sha-${GITHUB_SHA::7} [skip ci]"
+          git push origin HEAD:main
+
   deploy:
-    name: CD - Deploy to Kubernetes from self-hosted runner
+    name: CD - Manual direct-deploy fallback
     runs-on: [self-hosted, wallet-deploy]
     needs: dockerhub
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_to_cluster == true
@@ -199,10 +253,10 @@ jobs:
           kubectl get namespace wallet-demo --ignore-not-found
 
       - name: Validate Kubernetes manifests
-        run: kubectl apply --dry-run=client -f deploy/k8s/
+        run: kubectl apply --dry-run=client -k deploy/k8s/
 
       - name: Apply Kubernetes manifests
-        run: kubectl apply -f deploy/k8s/
+        run: kubectl apply -k deploy/k8s/
 
       - name: Deploy image by digest
         env:

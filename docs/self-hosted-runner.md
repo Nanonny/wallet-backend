@@ -97,7 +97,7 @@ The deploy job will:
 ```text
 1. Use the self-hosted runner with label wallet-deploy
 2. Validate Kubernetes access
-3. Apply deploy/k8s/
+3. Apply deploy/k8s/ with Kustomize
 4. Set wallet-api to the Docker Hub image digest pushed by the same workflow
 5. Wait for rollout status
 ```

@@ -16,10 +16,21 @@ type WalletRepository struct {
 	client *goredis.Client
 }
 
-func NewWalletRepository(addr string) *WalletRepository {
+func NewWalletRepository(addr, password string) *WalletRepository {
 	return &WalletRepository{
-		client: goredis.NewClient(&goredis.Options{Addr: addr}),
+		client: goredis.NewClient(&goredis.Options{
+			Addr:         addr,
+			Password:     password,
+			DialTimeout:  3 * time.Second,
+			ReadTimeout:  2 * time.Second,
+			WriteTimeout: 2 * time.Second,
+			PoolSize:     20,
+		}),
 	}
+}
+
+func (r *WalletRepository) Close() error {
+	return r.client.Close()
 }
 
 func (r *WalletRepository) Ping(ctx context.Context) error {
@@ -27,17 +38,19 @@ func (r *WalletRepository) Ping(ctx context.Context) error {
 }
 
 func (r *WalletRepository) CreateWallet(ctx context.Context, wallet domain.Wallet) error {
-	key := walletKey(wallet.ID)
-	pipe := r.client.TxPipeline()
-	pipe.HSet(ctx, key, map[string]any{
-		"id":            wallet.ID,
-		"user_id":       wallet.UserID,
-		"balance_cents": wallet.BalanceCents,
-		"created_at":    wallet.CreatedAt.Format(time.RFC3339Nano),
-	})
-	pipe.SAdd(ctx, "wallets", wallet.ID)
-	_, err := pipe.Exec(ctx)
-	return err
+	return r.CreateWalletWithBalance(ctx, wallet)
+}
+
+func (r *WalletRepository) CreateWalletWithBalance(ctx context.Context, wallet domain.Wallet) error {
+	txID := fmt.Sprintf("txn_%d", time.Now().UnixNano())
+	status, err := r.client.Eval(ctx, createWalletLua, []string{walletKey(wallet.ID), "wallets", transactionKey(txID)}, wallet.ID, wallet.UserID, wallet.BalanceCents, wallet.CreatedAt.Format(time.RFC3339Nano), txID).Text()
+	if err != nil {
+		return err
+	}
+	if status != "OK" {
+		return fmt.Errorf("create wallet lua status: %s", status)
+	}
+	return nil
 }
 
 func (r *WalletRepository) GetWallet(ctx context.Context, walletID string) (domain.Wallet, error) {
@@ -60,7 +73,9 @@ func (r *WalletRepository) GetWallet(ctx context.Context, walletID string) (doma
 
 func (r *WalletRepository) Deposit(ctx context.Context, walletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	txID := fmt.Sprintf("txn_%d", time.Now().UnixNano())
-	res, err := r.client.Eval(ctx, depositLua, []string{requestKey(requestID), walletKey(walletID), transactionKey(txID)}, amountCents, txID, time.Now().UTC().Format(time.RFC3339Nano)).Slice()
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	fingerprint := requestFingerprint(domain.TransactionDeposit, "", walletID, amountCents)
+	res, err := r.client.Eval(ctx, depositLua, []string{requestKey(requestID), walletKey(walletID), transactionKey(txID)}, amountCents, txID, createdAt, fingerprint).Slice()
 	if err != nil {
 		return domain.Transaction{}, err
 	}
@@ -69,7 +84,9 @@ func (r *WalletRepository) Deposit(ctx context.Context, walletID string, amountC
 
 func (r *WalletRepository) Withdraw(ctx context.Context, walletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	txID := fmt.Sprintf("txn_%d", time.Now().UnixNano())
-	res, err := r.client.Eval(ctx, withdrawLua, []string{requestKey(requestID), walletKey(walletID), transactionKey(txID)}, amountCents, txID, time.Now().UTC().Format(time.RFC3339Nano)).Slice()
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	fingerprint := requestFingerprint(domain.TransactionWithdraw, walletID, "", amountCents)
+	res, err := r.client.Eval(ctx, withdrawLua, []string{requestKey(requestID), walletKey(walletID), transactionKey(txID)}, amountCents, txID, createdAt, fingerprint).Slice()
 	if err != nil {
 		return domain.Transaction{}, err
 	}
@@ -78,7 +95,9 @@ func (r *WalletRepository) Withdraw(ctx context.Context, walletID string, amount
 
 func (r *WalletRepository) Transfer(ctx context.Context, fromWalletID string, toWalletID string, amountCents int64, requestID string) (domain.Transaction, error) {
 	txID := fmt.Sprintf("txn_%d", time.Now().UnixNano())
-	res, err := r.client.Eval(ctx, transferLua, []string{requestKey(requestID), walletKey(fromWalletID), walletKey(toWalletID), transactionKey(txID)}, amountCents, txID, time.Now().UTC().Format(time.RFC3339Nano)).Slice()
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	fingerprint := requestFingerprint(domain.TransactionTransfer, fromWalletID, toWalletID, amountCents)
+	res, err := r.client.Eval(ctx, transferLua, []string{requestKey(requestID), walletKey(fromWalletID), walletKey(toWalletID), transactionKey(txID)}, amountCents, txID, createdAt, fingerprint).Slice()
 	if err != nil {
 		return domain.Transaction{}, err
 	}
@@ -110,6 +129,13 @@ func parseLuaResult(res []any, txType, fromWalletID, toWalletID string, amountCe
 
 	switch status {
 	case "OK", "DUPLICATE":
+		if len(res) < 4 {
+			return domain.Transaction{}, errors.New("redis transaction result has no timestamp")
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, fmt.Sprint(res[3]))
+		if err != nil {
+			return domain.Transaction{}, fmt.Errorf("parse redis transaction timestamp: %w", err)
+		}
 		return domain.Transaction{
 			ID:           txID,
 			Type:         txType,
@@ -118,15 +144,21 @@ func parseLuaResult(res []any, txType, fromWalletID, toWalletID string, amountCe
 			AmountCents:  amountCents,
 			Status:       domain.StatusSuccess,
 			Message:      message,
-			CreatedAt:    time.Now().UTC(),
+			CreatedAt:    createdAt,
 		}, nil
 	case "INSUFFICIENT_FUNDS":
 		return domain.Transaction{}, domain.ErrInsufficientFunds
 	case "NOT_FOUND", "FROM_NOT_FOUND", "TO_NOT_FOUND":
 		return domain.Transaction{}, domain.ErrWalletNotFound
+	case "IDEMPOTENCY_CONFLICT":
+		return domain.Transaction{}, domain.ErrIdempotencyConflict
 	default:
 		return domain.Transaction{}, fmt.Errorf("redis lua status %s: %s", status, message)
 	}
+}
+
+func requestFingerprint(txType, from, to string, amount int64) string {
+	return fmt.Sprintf("%s|%s|%s|%d", txType, from, to, amount)
 }
 
 func walletKey(id string) string      { return "wallet:" + id }

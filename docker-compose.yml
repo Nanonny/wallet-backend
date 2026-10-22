@@ -1,0 +1,49 @@
+# Local development dependencies: Redis (wallet state) + PostgreSQL (accounts).
+#
+#   docker compose up -d          # start the stack
+#   make run                      # run wallet-api against it
+#
+# Zero-dependency alternative (no containers at all):
+#   make run-memory               # both stores in-process
+name: wallet-devops-lab
+
+services:
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --requirepass
+      - wallet
+      - --appendonly
+      - "yes"
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_PASSWORD: wallet
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=wallet redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  redis-data:
+  postgres-data:

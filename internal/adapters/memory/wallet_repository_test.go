@@ -56,6 +56,29 @@ func TestWalletRepositoryTransferIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestWalletRepositoryRejectsReusedRequestIDWithDifferentPayload(t *testing.T) {
+	ctx := context.Background()
+	repo := NewWalletRepository()
+	createTestWallet(t, repo, domain.Wallet{ID: "wallet-from", BalanceCents: 1000, CreatedAt: time.Now().UTC()})
+	createTestWallet(t, repo, domain.Wallet{ID: "wallet-to", CreatedAt: time.Now().UTC()})
+
+	if _, err := repo.Transfer(ctx, "wallet-from", "wallet-to", 100, "shared-request"); err != nil {
+		t.Fatalf("first transfer failed: %v", err)
+	}
+	_, err := repo.Transfer(ctx, "wallet-from", "wallet-to", 200, "shared-request")
+	if !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("reused request error = %v, want %v", err, domain.ErrIdempotencyConflict)
+	}
+
+	from, err := repo.GetWallet(ctx, "wallet-from")
+	if err != nil {
+		t.Fatalf("get source wallet: %v", err)
+	}
+	if from.BalanceCents != 900 {
+		t.Fatalf("source balance = %d, want 900", from.BalanceCents)
+	}
+}
+
 func TestWalletRepositoryWithdrawInsufficientFundsDoesNotMutateBalance(t *testing.T) {
 	ctx := context.Background()
 	repo := NewWalletRepository()

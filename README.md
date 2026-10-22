@@ -7,7 +7,9 @@ DevOps / Platform Engineering portfolio project using:
 - Golang
 - gRPC
 - Hexagonal Architecture
+- PostgreSQL (user accounts)
 - Redis
+- JWT authentication (bcrypt-hashed credentials, bearer tokens)
 - Envoy Load Balancer
 - Prometheus
 - Grafana
@@ -15,19 +17,26 @@ DevOps / Platform Engineering portfolio project using:
 
 > Note: The service includes `api/proto/wallet.proto`. To make the scaffold runnable immediately without requiring generated protobuf files, the included gRPC adapter uses grpc-go with a JSON codec and mirrors the proto messages. For production, generate normal protobuf stubs with `make proto` and replace the adapter with generated `walletpb` handlers.
 
+> Security: every `/v1/wallets/*` and `/v1/simulate/*` endpoint (HTTP **and** gRPC) now requires a bearer token obtained from `/v1/auth/login`. Credentials are stored as bcrypt hashes in PostgreSQL, sessions are HS256 JWTs, failed logins are rate-limited (10 per 15 min per IP+user), and wallets are owned by their account (an outsider's wallet returns 404, never 403/leaked data). Full report: [`docs/security-audit.md`](docs/security-audit.md).
+
 ---
 
 ## Architecture Diagram
 
 ```mermaid
 flowchart TD
-    U[User / hey load test] --> E[Envoy Proxy<br/>HTTP :8080<br/>gRPC :50051]
-    E --> P1[wallet-api pod 1<br/>Go HTTP + gRPC]
+    B[Browser / hey load test] --> L[Login page :8080/login<br/>register + login]
+    L --> JWT[/v1/auth/login<br/>bcrypt verify + issue JWT]
+    B --> E[Envoy Proxy<br/>HTTP :8080<br/>gRPC :50051]
+    E --> P1[wallet-api pod 1<br/>authn middleware<br/>+ ownership check]
     E --> P2[wallet-api pod 2<br/>Go HTTP + gRPC]
     E --> P3[wallet-api pod 3<br/>Go HTTP + gRPC]
     P1 --> R[(Redis<br/>wallet state<br/>transactions<br/>idempotency)]
     P2 --> R
     P3 --> R
+    P1 --> PG[(PostgreSQL :5432<br/>users<br/>bcrypt password hashes)]
+    P2 --> PG
+    P3 --> PG
     P1 --> M[/metrics :9090]
     P2 --> M
     P3 --> M
@@ -46,26 +55,40 @@ wallet-devops-lab/
 │   ├── wallet-api/main.go
 │   └── grpc-client/main.go
 ├── internal/
-│   ├── domain/
-│   ├── application/
+│   ├── domain/                  # Wallet, Transaction, User, errors
+│   ├── application/             # services, ports, subject context, token service
 │   ├── adapters/
-│   │   ├── http/
-│   │   ├── grpc/
-│   │   ├── redis/
-│   │   ├── memory/
+│   │   ├── http/                # wallet API + /v1/auth/* + static login UI
+│   │   ├── grpc/                # gRPC handlers + auth interceptor
+│   │   ├── redis/               # wallet state
+│   │   ├── memory/              # in-process wallet + user repositories
+│   │   ├── postgres/            # user accounts (accounts live here)
+│   │   ├── credential/          # bcrypt hashing + timing-equalized dummy
 │   │   └── metrics/
 │   └── config/
 ├── deploy/k8s/
 │   ├── 00-namespace.yaml
+│   ├── 00-secrets.yaml
 │   ├── 01-redis.yaml
+│   ├── 01b-postgres.yaml       # PostgreSQL Deployment + PVC + Service + PDB
 │   ├── 02-wallet-api.yaml
 │   ├── 03-envoy-config.yaml
 │   ├── 04-envoy.yaml
 │   ├── 05-prometheus.yaml
 │   ├── 06-grafana.yaml
 │   ├── 07-hpa.yaml
-│   └── 08-pdb.yaml
+│   ├── 08-pdb.yaml
+│   ├── 09-networkpolicy.yaml
+│   └── kustomization.yaml
+├── deploy/argocd/
+│   └── apps/wallet-api.yaml
+├── docs/
+│   ├── security-audit.md       # full security review + hardening notes
+│   ├── ci-cd-dockerhub.md
+│   ├── self-hosted-runner.md
+│   └── argocd-cd.md
 ├── loadtest/
+├── docker-compose.yml          # local Redis + PostgreSQL
 ├── Dockerfile
 ├── Makefile
 └── README.md
@@ -100,20 +123,38 @@ go mod tidy
 make run-memory
 ```
 
-Test HTTP API:
+Test HTTP API (all `/v1/*` calls need a bearer token now):
 
 ```bash
+# 1) create an account
+curl -X POST http://localhost:8080/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"demo","password":"wallet-demo-1234"}'
+
+# 2) log in and keep the token
+TOKEN=$(curl -s -X POST http://localhost:8080/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"demo","password":"wallet-demo-1234"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+
+# 3) use it on protected routes
 curl -X POST http://localhost:8080/v1/simulate/seed \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"users":10,"initial_balance_cents":100000}'
 
 curl -X POST http://localhost:8080/v1/simulate/transfer \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"users":10,"amount_cents":100}'
 
 curl http://localhost:8080/readyz
 curl http://localhost:9090/metrics
 ```
+
+Open `http://localhost:8080` for the built-in Wallet Console. It now opens at
+the login page (`/login`); after signing in it can create wallets, check
+balances, deposit, withdraw, and transfer without a separate frontend
+deployment.
 
 Test gRPC local client:
 
@@ -123,13 +164,73 @@ make grpc-client
 
 ---
 
-## Local Run With Redis
+## Local Run With Redis + PostgreSQL
+
+The full stack (Redis for wallet state, PostgreSQL for user accounts) runs
+with one command:
 
 ```bash
-docker run --name wallet-redis -p 6379:6379 -d redis:7-alpine
+make deps-up        # docker compose up -d  (redis:6379 + postgres:5432)
+make run
+```
 
+Or manually:
+
+```bash
+docker compose up -d
 go mod tidy
 make run
+```
+
+---
+
+## Authentication (PostgreSQL + JWT)
+
+All wallet and simulation endpoints are protected. The flow:
+
+```text
+GET  /login                      → minimal login UI (register / sign in tabs)
+POST /v1/auth/register           → {username, password}     → 201 user
+POST /v1/auth/login              → {username, password}     → 200 {token, user}
+POST /v1/auth/logout             → no-op (stateless JWTs)   → 204
+GET  /v1/auth/me                 → Bearer token             → 200 {username}
+```
+
+- **Storage:** users live in PostgreSQL (`users` table), passwords as **bcrypt** (cost 12). Only the hash reaches the database — never plaintext.
+- **Sessions:** HS256 JWT (`iss=wallet-api`, subject = username, 8h TTL), signed with `JWT_SECRET`. Send it as `Authorization: Bearer <token>`.
+- **Password policy:** 8–128 characters, at least one letter and one number.
+- **Usernames:** 3–32 characters, lowercase letters, numbers, or `_` (lookups are case-insensitive).
+- **Brute-force protection:** failed logins are rate-limited to 10 per 15 minutes per IP+username (HTTP 429 + `Retry-After`); unknown usernames still burn a bcrypt comparison (timing-leak guard).
+- **Ownership:** wallets belong to the account that created them. Another user's wallet returns `404` (no existence leak). Transfers **to** a foreign wallet are allowed (that is paying someone); transfers **from** one are not.
+- **gRPC:** the same tokens are accepted via the `authorization` (or `grpc-token`) metadata; missing/invalid → `UNAUTHENTICATED`.
+- **Metrics:** `wallet_auth_events_total{event="login|register|api_request",result=...}` is available in Prometheus/Grafana.
+
+Local demo helper (registers/logs in a `demo` user and prints its token):
+
+```bash
+make login
+```
+
+Environment variables (`internal/config/config.go`):
+
+| Variable     | Default    | Purpose                            |
+| ------------ | ---------- | ---------------------------------- |
+| `JWT_SECRET` | _(empty)*  | 16+ character token signing key    |
+| `PGHOST`     | `localhost`| PostgreSQL host                    |
+| `PGPORT`     | `5432`     | PostgreSQL port                    |
+| `PGUSER`     | `wallet`   | PostgreSQL user                    |
+| `PGPASSWORD` | `wallet`   | PostgreSQL password                |
+| `PGDATABASE` | `wallet`   | PostgreSQL database                |
+| `PGSSLMODE`  | `disable`  | TLS mode for the PG connection     |
+| `PG_DSN`     | _(empty)_  | Full DSN override (wins over PG_*) |
+
+\* With no `JWT_SECRET`, the server generates an ephemeral one and logs a big warning (sessions die with the process and multi-replica deployments disagree — always set it for real deployments; `deploy/k8s/00-secrets.yaml` shows the key).
+
+Run the Postgres integration test against the local compose database:
+
+```bash
+make deps-up
+make test-pg
 ```
 
 ---
@@ -155,14 +256,22 @@ eval $(minikube docker-env)
 docker build -t wallet-api:dev .
 ```
 
-Deploy:
+Deploy (this brings up Redis, **PostgreSQL**, wallet-api, Envoy, Prometheus,
+Grafana, plus the NetworkPolicies and PDBs):
 
 ```bash
-kubectl apply -f deploy/k8s/
+kubectl apply -k deploy/k8s/
 
 kubectl get pods -n wallet-demo
 kubectl get svc -n wallet-demo
 ```
+
+`wallet-api` retries its Postgres connection for up to 30 seconds at startup,
+so it is safe to roll the API before/while the database pod becomes ready.
+The API's `/login` UI and `/v1/auth/*` endpoints work exactly as in local dev;
+log in from the browser or via `curl` to get a bearer token.
+
+For GitOps CD with Argo CD, see `docs/argocd-cd.md`.
 
 ---
 
@@ -194,18 +303,36 @@ Prometheus:   http://localhost:9090
 Grafana:      http://localhost:3000
 ```
 
-Grafana default login:
+Grafana demo login:
 
 ```text
-admin / admin
+admin / wallet-demo-change-me
 ```
+
+Change the demo Redis, Postgres, Grafana, and JWT values in
+`deploy/k8s/00-secrets.yaml` before using a shared cluster. For production,
+replace this plain Kubernetes Secret with External Secrets, Sealed Secrets, or
+SOPS-encrypted configuration, and generate a strong JWT secret with
+`openssl rand -hex 32`.
 
 ---
 
 ## Seed Wallets Before Load Testing
 
+The make target handles authentication (it registers/logs in the `demo`
+account and attaches the bearer token):
+
 ```bash
+make seed
+```
+
+Manually, if you prefer raw curl:
+
+```bash
+TOKEN=$(make -s demo-token)
+
 curl -X POST http://localhost:8080/v1/simulate/seed \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"users":1000,"initial_balance_cents":100000}'
 ```
@@ -220,40 +347,23 @@ Install:
 brew install hey
 ```
 
-Smoke test:
+The make targets obtain a bearer token first, then run hey:
 
 ```bash
-hey -n 100 -c 5 \
-  -m POST \
-  -H "Content-Type: application/json" \
-  -d '{"users":100,"amount_cents":100}' \
-  http://localhost:8080/v1/simulate/transfer
+make load-smoke     # 100 requests, 5 concurrent
+make load-normal    # 30s, 20 concurrent (MacBook Air M4 friendly)
+make load-high      # 60s, 50 concurrent
 ```
 
-Normal load for MacBook Air M4:
+Or manually (with a token from `make login`):
 
 ```bash
 hey -z 30s -c 20 -q 2 \
   -m POST \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"users":500,"amount_cents":100}' \
   http://localhost:8080/v1/simulate/transfer
-```
-
-High but still local-safe:
-
-```bash
-hey -z 60s -c 50 -q 2 \
-  -m POST \
-  -H "Content-Type: application/json" \
-  -d '{"users":1000,"amount_cents":100}' \
-  http://localhost:8080/v1/simulate/transfer
-```
-
-Avoid starting with this on a MacBook Air:
-
-```bash
-hey -z 5m -c 500 http://localhost:8080/v1/simulate/transfer
 ```
 
 ---
@@ -287,6 +397,18 @@ HTTP status codes:
 sum(rate(wallet_http_requests_total[1m])) by (status)
 ```
 
+Auth events (logins, rejections, unauthorized API calls):
+
+```promql
+sum(increase(wallet_auth_events_total[15m])) by (event, result)
+```
+
+Failed logins per minute (a brute-force canary):
+
+```promql
+sum(rate(wallet_auth_events_total{event="login",result="invalid_credentials"}[5m]))
+```
+
 ---
 
 ## Grafana Panels to Create
@@ -299,6 +421,8 @@ sum(rate(wallet_http_requests_total[1m])) by (status)
 - Active wallets
 - CPU usage per pod
 - Memory usage per pod
+- Auth events (logins, rejections, unauthorized API calls)
+- Failed logins per minute
 
 ---
 
