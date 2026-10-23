@@ -50,6 +50,10 @@ spec:
               drop:
                 - ALL
           env:
+            # Azure Disk volumes contain lost+found at the root, which makes
+            # initdb refuse to use the mount point itself. Use a subdirectory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
               value: wallet
             - name: POSTGRES_PASSWORD

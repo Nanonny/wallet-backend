@@ -93,6 +93,9 @@ spec:
         runAsNonRoot: true
         runAsUser: 65534
         runAsGroup: 65534
+        # Makes the Azure Disk mounted at /prometheus writable by this user
+        # (otherwise: "open /prometheus/queries.active: permission denied").
+        fsGroup: 65534
         seccompProfile:
           type: RuntimeDefault
       containers:
