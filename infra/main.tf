@@ -59,7 +59,7 @@ resource "azurerm_kubernetes_cluster" "wallet" {
   default_node_pool {
     name       = "system"
     node_count = 1
-    vm_size    = "Standard_D2s_v3"
+    vm_size    = var.node_vm_size
   }
   # Keep stateful volumes (postgres, prometheus, redis) on managed premium
   # disks — also what `fsGroup: 70` needs (CSI honors fsGroup on these).

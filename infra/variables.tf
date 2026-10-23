@@ -21,3 +21,13 @@ variable "aks_name" {
   type        = string
   default     = "wallet-aks"
 }
+
+# This consumer subscription does not allow the plain Dv3 SKUs (Standard_D2s_v3)
+# in southeastasia — the allowed D-family SKU is the SSD variant DC2ds_v3
+# (same 2 vCPU / 8 GB). If provisioning is still blocked by quota, try the
+# next candidates from `az vm list-skus --location southeastasia`.
+variable "node_vm_size" {
+  description = "AKS node VM size allowed by this subscription/region."
+  type        = string
+  default     = "Standard_DC2ds_v3"
+}
