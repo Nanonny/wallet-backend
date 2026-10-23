@@ -202,9 +202,11 @@ stages:
               inlineScript: |
                 set -eu
                 az account show
-                # ACR_LOGIN_SERVER is derived from ACR_NAME so the two can never
-                # drift out of sync (login server is always <acr_name>.azurecr.io).
-                ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+                # Take the login server straight from Azure for whatever ACR_NAME
+                # points at — Azure is the source of truth, so it can never drift
+                # out of sync with the ACR that az acr login just authenticated to.
+                ACR_LOGIN_SERVER="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
+                echo ">> TARGET REGISTRY = ${ACR_LOGIN_SERVER}"
                 SHORT_SHA="$(git rev-parse --short HEAD)"
                 TAG="sha-${SHORT_SHA}"
                 IMG="$(ACR_LOGIN_SERVER)/wallet-api:${TAG}"
@@ -219,7 +221,10 @@ stages:
 
           - script: |
               set -eu
-              ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+              # DEPLOY_IMAGE (set by the build step from Azure's loginServer) already
+              # carries the correct registry host — reuse it for the pull secret.
+              ACR_LOGIN_SERVER="${DEPLOY_IMAGE%%/*}"
+              echo ">> TARGET REGISTRY = ${ACR_LOGIN_SERVER}"
               echo ">> deploying $(DEPLOY_IMAGE) to $(AKS_NAME)"
               kubectl apply -k deploy/k8s
               # Consumer subscription can't do RBAC role assignments -> use the
