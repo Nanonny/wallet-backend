@@ -202,6 +202,9 @@ stages:
               inlineScript: |
                 set -eu
                 az account show
+                # ACR_LOGIN_SERVER is derived from ACR_NAME so the two can never
+                # drift out of sync (login server is always <acr_name>.azurecr.io).
+                ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
                 SHORT_SHA="$(git rev-parse --short HEAD)"
                 TAG="sha-${SHORT_SHA}"
                 IMG="$(ACR_LOGIN_SERVER)/wallet-api:${TAG}"
@@ -216,6 +219,7 @@ stages:
 
           - script: |
               set -eu
+              ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
               echo ">> deploying $(DEPLOY_IMAGE) to $(AKS_NAME)"
               kubectl apply -k deploy/k8s
               # Consumer subscription can't do RBAC role assignments -> use the
