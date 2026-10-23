@@ -1,26 +1,3 @@
-# Azure Pipelines — CI/CD for wallet-devops-lab
-#
-# Flow:  CI (gofmt, tidy, vet, race tests, docker build check)
-#      -> CD (Azure SP login, build, push to ACR, deploy directly to AKS —
-#         "lab mode" direct deploy, no Argo CD on AKS).
-#
-# Required in Azure DevOps (project settings):
-#   1. ARM service connection named:  wallet-azure
-#      (Authentication method: Service principal, role: Contributor on the
-#       target subscription — ADO can create the SP for you in the wizard)
-#   2. Variable group (Pipelines -> Libraries) named:  wallet-azure-vars
-#        ACR_NAME               walletlab
-#        ACR_LOGIN_SERVER       walletlab.azurecr.io
-#        AKS_NAME               wallet-aks
-#        RG                     wallet-lab-rg
-#        TFARM_CLIENT_ID        <same SP client id>
-#        TFARM_TENANT_ID        <tenant id>
-#        TFARM_SUB_ID           <subscription id>
-#        TFARM_CLIENT_SECRET    <client secret — marked SECRET in ADO>
-#
-# Secrets: none stored in this repo — auth flows through the ARM service
-# connection's Service Principal.
-
 trigger:
   branches:
     include:
@@ -132,14 +109,18 @@ stages:
                   az provider register -n "$p" || echo "   register returned non-zero (may still be in progress)"
                 fi
               }
-              reg_provider Microsoft.ContainerRegistry
-              reg_provider Microsoft.ContainerService
+              # PolicyInsights is needed only while main.tf has azure_policy_enabled = true
+              PROVIDERS="Microsoft.ContainerRegistry Microsoft.ContainerService Microsoft.Compute Microsoft.Network Microsoft.Storage Microsoft.PolicyInsights"
+              for p in $PROVIDERS; do reg_provider "$p"; done
               ok=0
               for i in $(seq 1 36); do
-                s1="$(az provider show -n Microsoft.ContainerRegistry --query registrationState -o tsv 2>/dev/null)"
-                s2="$(az provider show -n Microsoft.ContainerService --query registrationState -o tsv 2>/dev/null)"
-                if [ "$s1" = "Registered" ] && [ "$s2" = "Registered" ]; then ok=1; break; fi
-                echo "   waiting for provider registration... ($s1 / $s2)"
+                pending=""
+                for p in $PROVIDERS; do
+                  s="$(az provider show -n "$p" --query registrationState -o tsv 2>/dev/null || echo Unknown)"
+                  [ "$s" = "Registered" ] || pending="$pending $p($s)"
+                done
+                if [ -z "$pending" ]; then ok=1; break; fi
+                echo "   waiting for provider registration...$pending"
                 sleep 10
               done
               [ "$ok" = "1" ] || { echo "##[error]resource providers not Registered after 6 min — see aka.ms/rps-not-found"; exit 1; }
@@ -174,6 +155,10 @@ stages:
               export ARM_TENANT_ID="$(TFARM_TENANT_ID)"
               export ARM_SUBSCRIPTION_ID="$(TFARM_SUB_ID)"
               export ARM_SKIP_PROVIDER_REGISTRATION=true
+              # ส่งค่าจาก variable group ให้ Terraform ใช้ชื่อเดียวกับที่ pipeline ใช้
+              export TF_VAR_resource_group="$(RG)"
+              export TF_VAR_acr_name="$(ACR_NAME)"
+              export TF_VAR_aks_name="$(AKS_NAME)"
               terraform init
               terraform apply -auto-approve
               terraform output
@@ -190,10 +175,8 @@ stages:
         variables:
           - group: wallet-azure-vars
         steps:
-          # Keep every `az` call inside ONE AzureCLI task: the CLI is
-          # provisioned per-task, so later plain-script steps cannot use it.
           - task: AzureCLI@2
-            displayName: "SP login, build & push to ACR, AKS credentials"
+            displayName: "Build, push to ACR, deploy to AKS"
             inputs:
               azureSubscription: "wallet-azure"
               scriptType: bash
@@ -202,61 +185,61 @@ stages:
               inlineScript: |
                 set -eu
                 az account show
-                # Take the login server straight from Azure for whatever ACR_NAME
-                # points at — Azure is the source of truth, so it can never drift
-                # out of sync with the ACR that az acr login just authenticated to.
-                ACR_LOGIN_SERVER="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
-                echo ">> TARGET REGISTRY = ${ACR_LOGIN_SERVER}"
+
+                # ---- registry: ดึงจาก Azure เป็น source of truth
+                LOGIN_SERVER="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
+                echo ">> TARGET REGISTRY = ${LOGIN_SERVER}"
+
                 SHORT_SHA="$(git rev-parse --short HEAD)"
                 TAG="sha-${SHORT_SHA}"
-                IMG="$(ACR_LOGIN_SERVER)/wallet-api:${TAG}"
-                echo ">> building $IMG"
-                docker build -t "$IMG" .
-                az acr update --name "$(ACR_NAME)" --admin-enabled true
-                # az acr login = docker login against the registry
-                az acr login --name "$(ACR_NAME)"
-                docker push "$IMG"
-                az aks get-credentials --name "$(AKS_NAME)" --resource-group "$(RG)"
-                echo "##vso[task.setvariable variable=DEPLOY_IMAGE]$(ACR_LOGIN_SERVER)/wallet-api:$TAG"
+                IMG="${LOGIN_SERVER}/wallet-api:${TAG}"
+
+                echo ">> building ${IMG}"
+                docker build -t "${IMG}" .
+
+                az acr update --name "${ACR_NAME}" --admin-enabled true
+                az acr login --name "${ACR_NAME}"
+                docker push "${IMG}"
+
+                # ---- AKS
+                az aks get-credentials --name "${AKS_NAME}" --resource-group "${RG}" --overwrite-existing
+
+                echo ">> deploying ${IMG} to ${AKS_NAME}"
+                kubectl apply -k deploy/k8s
+
+                ACR_USER="$(az acr credential show --name "${ACR_NAME}" --query username -o tsv)"
+                ACR_PW="$(az acr credential show --name "${ACR_NAME}" --query 'passwords[0].value' -o tsv)"
+                echo "##vso[task.setsecret]${ACR_PW}"
+
+                kubectl -n wallet-demo delete secret acr-credentials --ignore-not-found
+                kubectl -n wallet-demo create secret docker-registry acr-credentials \
+                  --docker-server="${LOGIN_SERVER}" \
+                  --docker-username="${ACR_USER}" \
+                  --docker-password="${ACR_PW}"
+
+                kubectl -n wallet-demo patch deployment wallet-api --type merge \
+                  -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-credentials"}]}}}}'
+                kubectl -n wallet-demo set image deployment/wallet-api wallet-api="${IMG}"
+                kubectl -n wallet-demo patch svc envoy --type merge \
+                  -p '{"spec":{"type":"LoadBalancer"}}'
+                kubectl -n wallet-demo rollout status deployment/wallet-api --timeout=300s
+                kubectl -n wallet-demo get pods -o wide
 
           - script: |
               set -eu
-              # DEPLOY_IMAGE (set by the build step from Azure's loginServer) already
-              # carries the correct registry host — reuse it for the pull secret.
-              ACR_LOGIN_SERVER="${DEPLOY_IMAGE%%/*}"
-              echo ">> TARGET REGISTRY = ${ACR_LOGIN_SERVER}"
-              echo ">> deploying $(DEPLOY_IMAGE) to $(AKS_NAME)"
-              kubectl apply -k deploy/k8s
-              # Consumer subscription can't do RBAC role assignments -> use the
-              # ACR admin user as a docker-registry imagePullSecret (lab path).
-              ACR_USER="$(az acr credential show --name "$(ACR_NAME)" --query adminUser -o tsv)"
-              ACR_PW="$(az acr credential show --name "$(ACR_NAME)" --query 'passwords[0].value' -o tsv)"
-              kubectl -n wallet-demo delete secret acr-credentials --ignore-not-found
-              kubectl -n wallet-demo create secret docker-registry acr-credentials \
-                --docker-server="$(ACR_LOGIN_SERVER)" \
-                --docker-username="${ACR_USER}" \
-                --docker-password="${ACR_PW}"
-              kubectl -n wallet-demo patch deployment wallet-api --type merge \
-                -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-credentials"}]}}}}'
-              kubectl -n wallet-demo set image deployment/wallet-api wallet-api="$(DEPLOY_IMAGE)"
-              # lab convenience: expose envoy through a public Azure LoadBalancer
-              kubectl -n wallet-demo patch svc envoy --type merge -p '{"spec":{"type":"LoadBalancer"}}'
-              kubectl -n wallet-demo rollout status deployment/wallet-api --timeout=300s
-              kubectl -n wallet-demo get pods -o wide
-            displayName: "Apply manifests + set image + rollout"
-
-          - script: |
-              set -eu
-              EXT_IP="$(kubectl -n wallet-demo get svc envoy -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
-              if [ -z "$EXT_IP" ]; then
-                echo "waiting for LoadBalancer IP allocation..."
-                sleep 60
+              # Azure LB IP allocation can take several minutes -> poll up to ~5 min
+              EXT_IP=""
+              for i in $(seq 1 30); do
                 EXT_IP="$(kubectl -n wallet-demo get svc envoy -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
-                [ -n "$EXT_IP" ] || { echo "##[error]LoadBalancer IP not ready"; exit 1; }
-              fi
+                [ -n "$EXT_IP" ] && break
+                echo "waiting for LoadBalancer IP allocation... ($i/30)"
+                sleep 10
+              done
+              [ -n "$EXT_IP" ] || { echo "##[error]LoadBalancer IP not ready"; kubectl -n wallet-demo describe svc envoy; exit 1; }
               echo ">> envoy external IP: $EXT_IP"
-              echo "==== smoke test ===="
-              curl --fail --silent --show-error "http://$EXT_IP/healthz"
+              # retry: the IP can answer before routing/pods are fully ready
+              CURL_RETRY="--retry 12 --retry-delay 10 --retry-all-errors --connect-timeout 10"
+              curl --fail --silent --show-error $CURL_RETRY "http://$EXT_IP/healthz"
               echo
-              curl --fail --silent --show-error "http://$EXT_IP/login" -o /dev/null -w "login page: HTTP %{http_code}\n"
+              curl --fail --silent --show-error $CURL_RETRY "http://$EXT_IP/login" -o /dev/null -w "login page: HTTP %{http_code}\n"
             displayName: "Smoke test public endpoint"
